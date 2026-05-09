@@ -2021,6 +2021,150 @@ def smart_exit_levels(S: float, K: float, T: float, r: float, sigma: float,
     }
 
 
+# ─── Institutional signal helpers ─────────────────────────────────────────────
+
+def iv_rank_percentile(symbol: str, current_iv: float, period: str = '1y'):
+    """
+    IV Rank and IV Percentile — the single most-used institutional filter.
+
+    Goldman Sachs, Citadel, and every vol desk screen on this before sizing
+    any long-vol trade. IVR < 30 = cheap; IVR > 60 = expensive, don't buy.
+
+    Uses rolling 21d HV as IV proxy (no historical IV feed required).
+    Returns (iv_rank 0–100, iv_percentile 0–100) or (nan, nan) on failure.
+    """
+    try:
+        hist = _ticker(symbol).history(period=period)['Close'].dropna()
+        if len(hist) < 30:
+            return np.nan, np.nan
+        lr = np.log(hist / hist.shift(1)).dropna()
+        hv_roll = lr.rolling(21).std().dropna() * np.sqrt(252)
+        if len(hv_roll) < 2:
+            return np.nan, np.nan
+        lo, hi = float(hv_roll.min()), float(hv_roll.max())
+        ivr = (current_iv - lo) / (hi - lo) * 100 if hi > lo else 50.0
+        ivp = float((hv_roll < current_iv).mean() * 100)
+        return round(ivr, 1), round(ivp, 1)
+    except Exception:
+        return np.nan, np.nan
+
+
+def real_world_option_ev(S: float, K: float, T: float, r: float,
+                          sigma: float, option_type: str,
+                          mu_annual: float, market_price: float,
+                          q: float = 0.0) -> float:
+    """
+    Real-world expected value of an option (Hakansson-Rubinstein P-measure).
+
+    Institutions run this to find positive EV. The key insight:
+      - Black-Scholes prices under Q (risk-neutral) measure: drift = r
+      - Real-world (P) measure uses actual historical drift = mu
+      - If the stock trends, real-world call value > BS price → edge for buyer
+
+    EV > 0 means the option is mathematically cheap given the stock's history.
+    EV < 0 means the market is pricing it fairly or expensive.
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return np.nan
+    mu_adj = mu_annual - q
+    d1 = (np.log(S / K) + (mu_adj + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    fwd_factor = np.exp((mu_adj - r) * T)
+    if option_type == 'call':
+        rw_val = S * fwd_factor * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    else:
+        rw_val = K * np.exp(-r * T) * norm.cdf(-d2) - S * fwd_factor * norm.cdf(-d1)
+    return round(float(rw_val - market_price), 4)
+
+
+def earnings_within_dte(symbol: str, dte_max: int):
+    """
+    Returns (True, 'YYYY-MM-DD') if earnings fall within next dte_max days.
+
+    Institutions always flag this — earnings are a vol event already priced in.
+    Buying options before earnings is paying double: the stock IV is inflated
+    specifically BECAUSE of the earnings uncertainty. After announcement,
+    IV collapses ('vol crush'), killing option value even if you're right on direction.
+    """
+    try:
+        cal = _ticker(symbol).calendar
+        if cal is None:
+            return False, None
+        today = datetime.now().date()
+        # yfinance returns calendar as dict with list values
+        if isinstance(cal, dict):
+            dates = []
+            for v in cal.values():
+                if isinstance(v, list):
+                    dates.extend(v)
+                else:
+                    dates.append(v)
+        elif hasattr(cal, 'columns'):
+            dates = list(cal.columns)
+        else:
+            return False, None
+        for d in dates:
+            try:
+                if hasattr(d, 'date'):
+                    dd = d.date()
+                else:
+                    dd = datetime.strptime(str(d)[:10], '%Y-%m-%d').date()
+                days_away = (dd - today).days
+                if 0 <= days_away <= dte_max:
+                    return True, str(dd)
+            except Exception:
+                continue
+        return False, None
+    except Exception:
+        return False, None
+
+
+def compute_rsi(prices: list, period: int = 14) -> float:
+    """
+    Wilder RSI — momentum position signal used by every institution.
+
+    Institutions use RSI not to time entries but to avoid paying for
+    momentum that's already exhausted:
+      - Buying a call when RSI > 70 = chasing an overbought move
+      - Buying a put when RSI < 30 = buying fear at maximum panic
+    Best entries: RSI 40–60 for calls (fresh uptrend), RSI 40–60 for puts (fresh downtrend).
+    """
+    if len(prices) < period + 1:
+        return 50.0
+    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    recent = deltas[-period:]
+    gains  = [d if d > 0 else 0.0 for d in recent]
+    losses = [-d if d < 0 else 0.0 for d in recent]
+    avg_g  = sum(gains) / period
+    avg_l  = sum(losses) / period
+    if avg_l == 0:
+        return 100.0
+    return round(100.0 - 100.0 / (1.0 + avg_g / avg_l), 1)
+
+
+def kelly_fraction_options(p_itm: float, win_multiple: float,
+                            loss_multiple: float = 1.0) -> float:
+    """
+    Kelly criterion adapted for options (Thorp 1969, refined by Haghani 2017).
+
+    Institutions never risk more than half Kelly (too volatile).
+    For retail: use quarter-Kelly for safety margin.
+
+    p_itm: probability option expires ITM (rough p_win proxy)
+    win_multiple: how many times premium you expect to make when right
+                  (e.g. 2.0 = you double your money on winners)
+    loss_multiple: how many times premium lost when wrong (1.0 = full loss)
+
+    Returns fraction of account to risk (capped at 25% = quarter-Kelly max).
+    """
+    if win_multiple <= 0 or p_itm <= 0 or p_itm >= 1:
+        return 0.0
+    b = win_multiple / loss_multiple
+    f_full = (b * p_itm - (1.0 - p_itm)) / b   # full Kelly
+    f_half = f_full / 2.0                         # half Kelly (institutional standard)
+    return round(max(0.0, min(f_half, 0.25)), 3)  # cap at 25%
+
+
 # ─── Trade Finder  (main entry point for live trading decisions) ──────────────
 
 def find_trade(symbol=None, S=None, hv=None, q=None):
@@ -2142,6 +2286,39 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
         print(f"     Bid/Ask quotes are $0.00 — using yesterday's lastPrice.")
         print(f"     Scores and spreads are estimates only. Re-run after 9:30 AM ET for live quotes.\n")
 
+    # ── Institutional pre-scan signals (computed once, reused in loop) ──────────
+    opt_str_pre = 'call' if option_type.startswith('c') else 'put'
+
+    # 1. IVR / IVP — Goldman/Citadel screen #1: is vol cheap or expensive?
+    print("  Computing IV Rank / IV Percentile...")
+    ivr, ivp = iv_rank_percentile(symbol, hv)
+    if not np.isnan(ivr):
+        ivr_label = ('CHEAP — good time to buy vol' if ivr < 30
+                     else 'FAIR' if ivr < 60
+                     else 'EXPENSIVE — vol buyers get edge only if IVR < 40')
+        print(f"  IVR: {ivr:.0f}  |  IVP: {ivp:.0f}  →  {ivr_label}")
+
+    # 2. Historical mu (P-measure drift) for real-world EV
+    try:
+        _px_hist = list(_ticker(symbol).history(period='2y')['Close'].dropna())
+        _lr_hist = [np.log(_px_hist[k]/_px_hist[k-1]) for k in range(1, len(_px_hist))]
+        mu_annual = float(np.mean(_lr_hist[-252:]) * 252) if len(_lr_hist) >= 252 else 0.08
+        rsi_14    = compute_rsi(_px_hist)
+    except Exception:
+        _px_hist  = []
+        _lr_hist  = []
+        mu_annual = 0.08
+        rsi_14    = 50.0
+    print(f"  RSI(14): {rsi_14:.1f}  |  1y mu (drift): {mu_annual*100:+.1f}%/yr")
+
+    # 3. Earnings calendar risk
+    has_earnings, earnings_date = earnings_within_dte(symbol, dte_max)
+    if has_earnings:
+        print(f"  ⚠  Earnings within DTE window: {earnings_date}  "
+              f"— IV may be inflated; expect vol crush after announcement")
+    else:
+        print(f"  ✓  No earnings within {dte_min}–{dte_max} DTE window")
+
     # Collect matching contracts across all expiries in DTE range
     today       = datetime.now().replace(tzinfo=None)
     expirations = _ticker(symbol).options
@@ -2170,7 +2347,7 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
             oi    = row.get('openInterest', 0) or 0
             vol   = row.get('volume', 0) or 0
 
-            unquoted = (bid == 0 and ask == 0)   # no live market-maker quote
+            unquoted = (bid == 0 and ask == 0)
 
             price = mid_price(row)
             if not (min_prem <= price <= max_prem):
@@ -2183,7 +2360,6 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
             g    = bs_greeks(S, K, T, r, sig, opt_str, q)
             delta = g['delta']
 
-            # Delta filter
             if delta_target is not None:
                 if abs(delta - delta_target) > 0.15:
                     continue
@@ -2192,47 +2368,119 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
             time_val   = max(0, price - intrinsic)
             p_itm      = prob_expire_itm(S, K, T, r, sig, opt_str, q)
 
-            # Hard quality floor for buyers: reject lottery tickets
             if action == 'b':
                 p_itm_val = p_itm * 100 if not np.isnan(p_itm) else 0
-                if p_itm_val < 15:           # < 15% chance of expiring ITM → skip
+                if p_itm_val < 15:
                     continue
-                if oi == 0 and vol == 0:     # completely dead — no market at all
+                if oi == 0 and vol == 0:
                     continue
+
             amer_price = american_option_price(S, K, T, r, sig, opt_str, q)
             eep        = american_early_exercise_premium(S, K, T, r, sig, opt_str, q)
             exp_mv     = expected_move(S, sig, T)
 
-            # Breakeven at expiry
             breakeven          = (K + price) if opt_str == 'call' else (K - price)
             breakeven_move_pct = abs(breakeven - S) / S * 100
 
-            # ── Scoring ─────────────────────────────────────────────────────────
-            # Liquidity penalty: OI=0, low volume, or no live quote hurts score
-            liq_penalty = ((50 if oi == 0 else 0)
-                           + (20 if vol < 10 else 0)
-                           + (25 if unquoted else 0))
+            # Real-world EV (P-measure edge)
+            rw_ev = real_world_option_ev(S, K, T, r, sig, opt_str, mu_annual, price, q)
 
+            # ── Institutional scoring ──────────────────────────────────────────
+            liq_penalty  = ((50 if oi == 0 else 0)
+                            + (20 if vol < 10 else 0)
+                            + (25 if unquoted else 0))
             iv_hv_spread = (iv - hv) * 100 if not np.isnan(iv) else 0
 
             if action == 'b':
-                # Buyers want: reasonable delta for the price paid, cheap IV vs HV,
-                # high prob ITM, not too far OTM (move needed < 10%)
                 p_itm_pct = (p_itm * 100) if not np.isnan(p_itm) else 0
+
+                # Signal 1: IV Rank — buying cheap vol is the core institutional edge
+                ivr_score = 0.0
+                if not np.isnan(ivr):
+                    if ivr < 20:   ivr_score = 30    # vol very cheap
+                    elif ivr < 35: ivr_score = 20
+                    elif ivr < 50: ivr_score = 5
+                    elif ivr < 65: ivr_score = -15
+                    else:          ivr_score = -35   # vol very expensive
+
+                # Signal 2: Real-world EV (P-measure drift vs market price)
+                ev_score = 0.0
+                if not np.isnan(rw_ev):
+                    ev_score = max(-25.0, min(25.0, (rw_ev / price) * 30))
+
+                # Signal 3: Delta/prob — reward sweet spot, not lottery tickets
+                # ATM to slight OTM (delta 0.25–0.50) is the institutional sweet spot
+                delta_abs = abs(delta)
+                if 0.30 <= delta_abs <= 0.55:
+                    delta_score = 25
+                elif 0.20 <= delta_abs < 0.30:
+                    delta_score = 12
+                elif 0.15 <= delta_abs < 0.20:
+                    delta_score = 0
+                else:
+                    delta_score = -20   # deep OTM lottery ticket
+
+                # Signal 4: Momentum alignment via RSI
+                rsi_score = 0.0
+                if opt_str == 'call':
+                    if 40 <= rsi_14 <= 62:     rsi_score = 15   # fresh uptrend
+                    elif 62 < rsi_14 <= 72:    rsi_score = 0    # getting extended
+                    elif rsi_14 > 72:          rsi_score = -20  # overbought — chasing
+                    elif rsi_14 < 35:          rsi_score = -15  # call on falling knife
+                else:  # put
+                    if 38 <= rsi_14 <= 60:     rsi_score = 15   # fresh downtrend
+                    elif 28 <= rsi_14 < 38:    rsi_score = 0    # getting extended
+                    elif rsi_14 < 28:          rsi_score = -20  # oversold panic — puts expensive
+                    elif rsi_14 > 65:          rsi_score = -15  # put on rising stock
+
+                # Signal 5: Move needed — don't need stock to gap 20% to profit
+                move_score = max(-30.0, -breakeven_move_pct * 1.2)
+
+                # Signal 6: IV vs HV — paying premium vs getting discount
+                iv_score = -max(iv_hv_spread, 0) * 0.5 + min(0, iv_hv_spread) * 0.3
+
+                # Signal 7: Earnings penalty — vol crush risk
+                earn_penalty = -25 if has_earnings else 0
+
+                # Signal 8: IV-HV when IV already low — extra reward for buying cheap
+                cheap_bonus = 10 if iv_hv_spread < -5 else 0
+
                 score = (
-                    abs(delta) * 50                    # rewrd sensitivity
-                    + p_itm_pct * 0.5                  # reward higher prob
-                    - breakeven_move_pct * 1.5         # penalise far OTM
-                    - max(iv_hv_spread, 0) * 0.4       # penalise expensive IV
-                    - liq_penalty                      # penalise illiquidity
-                )
-            else:
-                # Sellers want: high theta income, IV > HV (edge), liquid fills
-                score = (
-                    g['theta'] * -100                  # theta per contract/day
-                    + max(iv_hv_spread, 0) * 0.3       # reward IV premium
+                    ivr_score
+                    + ev_score
+                    + delta_score
+                    + rsi_score
+                    + move_score
+                    + iv_score
+                    + earn_penalty
+                    + cheap_bonus
                     - liq_penalty
                 )
+
+                # Kelly fraction for display in scorecard
+                avg_win_mult = (take_profit_est := 1.5)  # assume 1.5x avg winner
+                kelly = kelly_fraction_options(p_itm_pct / 100, avg_win_mult)
+
+            else:  # sellers
+                # Signal 1: IV premium (core seller edge)
+                iv_prem_score = max(iv_hv_spread, 0) * 0.5
+
+                # Signal 2: IVR — sell high vol
+                sell_ivr = 0.0
+                if not np.isnan(ivr):
+                    if ivr > 70:   sell_ivr = 30
+                    elif ivr > 50: sell_ivr = 15
+                    elif ivr > 35: sell_ivr = 5
+                    else:          sell_ivr = -20  # vol too cheap to sell
+
+                score = (
+                    g['theta'] * -100     # theta income
+                    + iv_prem_score
+                    + sell_ivr
+                    - liq_penalty
+                )
+                kelly = 0.0
+                rw_ev = rw_ev if not np.isnan(rw_ev) else 0.0
 
             results.append({
                 'Expiry':                 exp,
@@ -2246,6 +2494,12 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
                 'IV (%)':                 round(iv * 100, 1) if not np.isnan(iv) else np.nan,
                 'HV (%)':                 round(hv * 100, 1),
                 'IV-HV Spread (%)':       round(iv_hv_spread, 1),
+                'IV Rank':                ivr if not np.isnan(ivr) else np.nan,
+                'IV Percentile':          ivp if not np.isnan(ivp) else np.nan,
+                'RSI(14)':                rsi_14,
+                'Real-World EV ($)':      round(rw_ev, 3) if not np.isnan(rw_ev) else np.nan,
+                'Kelly Fraction':         round(kelly, 3) if action == 'b' else np.nan,
+                'Earnings Risk':          earnings_date if has_earnings else 'None',
                 'Delta':                  round(delta, 3),
                 'Theta ($/day)':          round(g['theta'], 3),
                 'Gamma':                  round(g['gamma'], 5),
@@ -2319,12 +2573,11 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
     print(f"{'─'*60}")
 
     display_cols = ['Expiry', 'DTE', 'Strike', 'Moneyness', 'Mid Price ($)',
-                    'Bid-Ask Spread ($)', 'IV (%)', 'IV-HV Spread (%)',
+                    'Bid-Ask Spread ($)', 'IV (%)', 'IV Rank', 'IV-HV Spread (%)',
                     'Delta', 'Theta ($/day)', 'Prob ITM (%)',
-                    'Breakeven @ Expiry', 'Move Needed (%)', 'Volume']
+                    'Real-World EV ($)', 'Move Needed (%)', 'Volume']
     top10 = df[display_cols].head(10)
 
-    # Print as a readable table
     print(top10.to_string(index=True))
     print(f"\n{'─'*60}")
 
@@ -2338,22 +2591,70 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
     print(f"  Bid-Ask Spread:      ${best['Bid-Ask Spread ($)']:.2f}  {'⚠ wide' if best['Bid-Ask Spread ($)'] > best['Mid Price ($)']*0.10 else '✓ tight'}")
     print(f"  American Price:      ${best['American Price ($)']:.2f}  (European: ${best['Mid Price ($)'] - best['Early Exercise Prem ($)']:.2f})")
     print(f"  Early Exercise Prem: ${best['Early Exercise Prem ($)']:.3f}")
-    print(f"  ─── Volatility ─────────────────────────")
+
+    print(f"  ─── Institutional Vol Signals ──────────")
     print(f"  Implied Vol:         {best['IV (%)']:.1f}%")
     print(f"  Historical Vol:      {best['HV (%)']:.1f}%")
-    iv_signal = 'EXPENSIVE — vol sellers edge' if best['IV-HV Spread (%)'] > 3 else ('CHEAP — vol buyers edge' if best['IV-HV Spread (%)'] < -3 else 'FAIR')
+    iv_signal = ('EXPENSIVE — vol sellers edge' if best['IV-HV Spread (%)'] > 3
+                 else 'CHEAP — vol buyers edge' if best['IV-HV Spread (%)'] < -3
+                 else 'FAIR')
     print(f"  IV vs HV:            {best['IV-HV Spread (%)']:+.1f}%  → {iv_signal}")
+    # IV Rank / Percentile — primary institutional screen
+    if not np.isnan(best.get('IV Rank', np.nan)):
+        ivr_v = best['IV Rank']
+        ivp_v = best['IV Percentile']
+        ivr_color = ('✓ CHEAP — ideal for buyers' if ivr_v < 30
+                     else '⚠ FAIR' if ivr_v < 60
+                     else '✗ EXPENSIVE — risk of IV crush')
+        print(f"  IV Rank (IVR):       {ivr_v:.0f}/100  →  {ivr_color}")
+        print(f"  IV Percentile (IVP): {ivp_v:.0f}%  (vol cheaper than {ivp_v:.0f}% of past year)")
+
     print(f"  ─── Greeks ─────────────────────────────")
     print(f"  Delta:               {best['Delta']:+.3f}  (${abs(best['Delta'])*100:.0f} P&L per $1 move, 100 shares)")
     print(f"  Theta:               {best['Theta ($/day)']:.3f}  (${best['Theta ($/day)']*100:.2f}/day per contract)")
     print(f"  Gamma:               {best['Gamma']:.5f}")
     print(f"  Vega:                {best['Vega ($/1%vol)']:.3f}  (${best['Vega ($/1%vol)']*100:.2f} per 1% IV change)")
+
+    print(f"  ─── Momentum (RSI) ─────────────────────")
+    rsi_v = best.get('RSI(14)', rsi_14)
+    if opt_str_pre == 'call':
+        rsi_label = ('✓ Fresh uptrend — not extended' if 40 <= rsi_v <= 62
+                     else '⚠ Getting overbought' if 62 < rsi_v <= 72
+                     else '✗ Overbought — chasing' if rsi_v > 72
+                     else '✗ Falling knife — calls risky')
+    else:
+        rsi_label = ('✓ Fresh downtrend — not extended' if 38 <= rsi_v <= 60
+                     else '⚠ Getting oversold' if 28 <= rsi_v < 38
+                     else '✗ Oversold panic — puts expensive' if rsi_v < 28
+                     else '✗ Rising stock — puts risky')
+    print(f"  RSI(14):             {rsi_v:.1f}  →  {rsi_label}")
+
     print(f"  ─── Risk / Reward ──────────────────────")
     print(f"  Intrinsic Value:     ${best['Intrinsic ($)']:.2f}")
     print(f"  Time Value:          ${best['Time Value ($)']:.2f}")
     print(f"  Breakeven @ expiry:  ${best['Breakeven @ Expiry']:.2f}  (need {best['Move Needed (%)']:.1f}% move)")
     print(f"  Prob of expiring ITM:{best['Prob ITM (%)']:.1f}%")
     print(f"  Expected 1σ move:    ${best['Expected Move ($)']:.2f}")
+
+    # Real-world EV and Kelly — institutional sizing and edge check
+    if action == 'b':
+        ev_v = best.get('Real-World EV ($)', np.nan)
+        kf_v = best.get('Kelly Fraction', 0.0)
+        print(f"  ─── Edge & Sizing (Institutional) ─────")
+        if not np.isnan(ev_v if ev_v is not None else np.nan):
+            ev_prem_pct = ev_v / best['Mid Price ($)'] * 100
+            ev_label = ('POSITIVE EDGE — stock drift favors buyer' if ev_v > 0
+                        else 'NEGATIVE EDGE — market pricing is fair/expensive')
+            print(f"  Real-World EV:       ${ev_v:+.3f}/share  ({ev_prem_pct:+.1f}% of premium)  →  {ev_label}")
+            print(f"  [Hakansson-Rubinstein P-measure: uses {mu_annual*100:+.1f}%/yr historical drift]")
+        if not np.isnan(kf_v if kf_v is not None else np.nan):
+            kf_pct = kf_v * 100
+            kf_contracts = max(1, int(kf_v * 10000 / (best['Mid Price ($)'] * 100)))
+            print(f"  Kelly Fraction:      {kf_pct:.1f}% of account  →  ~{kf_contracts} contract(s) per $10k")
+            print(f"  [Half-Kelly: Thorp 1969. Quarter-Kelly recommended for retail traders]")
+        if has_earnings:
+            print(f"  ⚠  Earnings on {earnings_date} — IV will collapse after announcement.")
+            print(f"     If trading through earnings: buy a straddle, not a directional contract.")
     print(f"  ─── Liquidity ──────────────────────────")
     print(f"  Volume:              {int(best['Volume']):,}")
     print(f"  Open Interest:       {int(best['Open Interest']):,}")

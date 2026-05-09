@@ -1,0 +1,9 @@
+streamlit
+pandas
+requests
+yfinance
+openpyxl
+scipy
+curl_cffi
+numpy
+optionlab

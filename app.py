@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore')
 
 import en_option_v3 as opt
 
-st.set_page_config(page_title="Stock Options Engine", layout="wide")
+st.set_page_config(page_title="Quantitative Options Engine", layout="wide")
 
 # --- Helper to capture CLI output and smart-mock input ---
 def run_cli_function(func, prompt_map, *args, **kwargs):
@@ -83,8 +83,8 @@ selected_model = st.sidebar.selectbox(
 )
 
 # --- Main App ---
-st.title("📈 Stock Options Engine")
-st.markdown("Configure the parameters below and click Run. The app will automatically navigate the CLI prompts for you.")
+st.title("Quantitative Options Engine")
+st.markdown("Configure the parameters below and execute. The system automatically navigates the underlying analytical models.")
 
 mode = st.selectbox("Select Mode", [
     "1. Full Analysis",
@@ -239,15 +239,15 @@ if st.session_state.df_result is not None:
     st.subheader("Data Result")
     st.dataframe(st.session_state.df_result)
 
-# --- Optional AI Analysis ---
+# --- Optional Synthesis ---
 if st.session_state.cli_output:
     st.divider()
-    st.subheader("🤖 Optional AI Analysis")
-    st.markdown("Want the AI to summarize this output and provide recommendations?")
+    st.subheader("Algorithmic Synthesis & Strategy Recommendation")
+    st.markdown("Execute natural language synthesis of quantitative outputs.")
     
-    if st.button("Analyze Output with AI"):
+    if st.button("Synthesize Output"):
         if not api_key:
-            st.error("Please enter your MegaLLM API Key in the sidebar first.")
+            st.error("Please enter your API Key in the sidebar first.")
         else:
             with st.spinner(f"Generating insights using {selected_model}..."):
                 text_to_analyze = st.session_state.cli_output[-4000:]
@@ -289,4 +289,4 @@ Please provide:
                     else:
                         st.error(f"API Error ({ai_res.status_code}): {ai_res.text}")
                 except Exception as e:
-                    st.error(f"Failed to connect to AI API: {e}")
+                    st.error(f"Failed to connect to LLM API: {e}")

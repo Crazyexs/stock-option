@@ -199,8 +199,12 @@ class _YFDirect:
 
 
 def _ticker(symbol: str):
-    """Factory: returns a standard yfinance Ticker, bypassing the broken custom client."""
-    return yf.Ticker(symbol)
+    """Factory: returns a standard yfinance Ticker with a custom session to avoid rate limits."""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    })
+    return yf.Ticker(symbol, session=session)
 
 
 # ─── Treasury Yield Curve (wallstreet-inspired) ───────────────────────────────
@@ -221,6 +225,7 @@ _yield_curve_fn = None   # cached after first fetch
 
 def _build_yield_curve() -> interp1d:
     """Fetch 4 treasury points and return a linear interpolation function."""
+    import time
     maturities, rates = [], []
     for T, ticker in _TREASURY_TICKERS.items():
         try:
@@ -228,6 +233,7 @@ def _build_yield_curve() -> interp1d:
             if not hist.empty:
                 maturities.append(T)
                 rates.append(hist.iloc[-1] / 100)
+            time.sleep(0.2)
         except Exception:
             pass
     if len(maturities) < 2:
@@ -1514,6 +1520,7 @@ def main():
     print(f"  Analysing {len(expirations)} expiry dates (full BS chain)")
 
     all_dfs = []
+    import time
     for i, exp in enumerate(expirations, 1):
         try:
             print(f"  [{i}/{len(expirations)}] {exp} ...", end=' ', flush=True)
@@ -1523,6 +1530,7 @@ def main():
                   f"(early exercise premium range: "
                   f"${df['Early Exercise Prem ($)'].dropna().min():.3f}–"
                   f"${df['Early Exercise Prem ($)'].dropna().max():.3f})")
+            time.sleep(0.5) # Prevent rate limiting
         except Exception as e:
             print(f"skipped ({e})")
 

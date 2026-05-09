@@ -198,9 +198,9 @@ class _YFDirect:
         )
 
 
-def _ticker(symbol: str) -> _YFDirect:
-    """Factory: returns a _YFDirect (fc.yahoo.com-free) Ticker."""
-    return _YFDirect(symbol)
+def _ticker(symbol: str):
+    """Factory: returns a standard yfinance Ticker, bypassing the broken custom client."""
+    return yf.Ticker(symbol)
 
 
 # ─── Treasury Yield Curve (wallstreet-inspired) ───────────────────────────────

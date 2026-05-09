@@ -199,12 +199,8 @@ class _YFDirect:
 
 
 def _ticker(symbol: str):
-    """Factory: returns a standard yfinance Ticker with a custom session to avoid rate limits."""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    })
-    return yf.Ticker(symbol, session=session)
+    """Factory: returns a standard yfinance Ticker."""
+    return yf.Ticker(symbol)
 
 
 # ─── Treasury Yield Curve (wallstreet-inspired) ───────────────────────────────

@@ -843,6 +843,12 @@ def fetch_cboe_chain(symbol: str) -> pd.DataFrame:
         resp = requests.get(url, headers=_CBOE_HEADERS, timeout=10)
         resp.raise_for_status()
         data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code in (401, 403, 404):
+            print(f"  [CBOE] Endpoint returned {e.response.status_code} for {symbol}. Falling back...")
+        else:
+            print(f"  [CBOE] HTTP Error for {symbol}: {e}")
+        return pd.DataFrame()
     except Exception as e:
         print(f"  [CBOE] Could not fetch {symbol}: {e}")
         return pd.DataFrame()

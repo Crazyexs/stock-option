@@ -7,3 +7,5 @@ scipy
 curl_cffi
 numpy
 optionlab
+arch
+pytz

@@ -62,19 +62,39 @@ warnings.filterwarnings('ignore')
 
 _OptionChain = namedtuple('OptionChain', ['calls', 'puts'])
 
+# ── Module-level data cache (TTL = 5 min) — prevents duplicate API calls ──────
+import time as _time
+_DATA_CACHE: dict = {}
+_CACHE_TTL = 300   # seconds
+
+
+def _cache_get(key):
+    entry = _DATA_CACHE.get(key)
+    if entry and (_time.time() - entry[1]) < _CACHE_TTL:
+        return entry[0]
+    return None
+
+
+def _cache_set(key, value):
+    _DATA_CACHE[key] = (value, _time.time())
+
+
 class _YFDirect:
     """
-    Drop-in replacement for yf.Ticker() that never touches fc.yahoo.com.
+    Drop-in replacement for yf.Ticker() that bypasses fc.yahoo.com entirely,
+    adds per-call data caching (5-min TTL) and retry with exponential back-off
+    so a single 429 does not crash the whole analysis run.
 
     Usage is identical to yf.Ticker:
         t = _YFDirect('AAPL')
-        t.history(period='1y')   → DataFrame with 'Close' column
-        t.options                → tuple of expiry date strings
-        t.option_chain('2025-06-20')  → namedtuple(calls=df, puts=df)
-        t.info                   → dict with 'dividendYield' etc.
+        t.history(period='1y')              → DataFrame with 'Close' column
+        t.options                           → tuple of expiry date strings
+        t.option_chain('2025-06-20')        → namedtuple(calls=df, puts=df)
+        t.info                              → dict with 'dividendYield' etc.
+        t.calendar                          → dict with 'Earnings Date' list
     """
 
-    _session  = None   # shared across all instances — one auth per process
+    _session  = None
     _crumb    = None
 
     _Q1 = 'https://query1.finance.yahoo.com'
@@ -86,7 +106,7 @@ class _YFDirect:
     }
 
     def __init__(self, symbol: str):
-        self.symbol = symbol.upper().replace('^', '%5E')
+        self.symbol      = symbol.upper().replace('^', '%5E')
         self._raw_symbol = symbol.upper()
         _YFDirect._ensure_session()
 
@@ -100,107 +120,198 @@ class _YFDirect:
         except ImportError:
             cls._session = requests.Session()
             cls._session.headers.update(cls._HEADERS)
+        try:
+            cls._session.get('https://finance.yahoo.com', timeout=12)
+            r = cls._session.get(f'{cls._Q1}/v1/test/getcrumb', timeout=10)
+            cls._crumb = r.text.strip() if r.status_code == 200 else ''
+        except Exception:
+            cls._crumb = ''
 
-        # Get cookies
-        cls._session.get('https://finance.yahoo.com', timeout=12)
-        # Get crumb
-        r = cls._session.get(f'{cls._Q1}/v1/test/getcrumb', timeout=10)
-        cls._crumb = r.text.strip() if r.status_code == 200 else ''
+    @classmethod
+    def _reset_session(cls):
+        """Force re-auth on next call (used after persistent 429)."""
+        cls._session = None
+        cls._crumb   = None
 
-    def _get(self, path, params=None):
+    def _get(self, path, params=None, _retries=4):
+        """
+        GET with exponential back-off on 429 / 5xx.
+        Waits 2s, 4s, 8s, 16s before giving up.
+        """
         p = dict(params or {})
         if self._crumb:
             p['crumb'] = self._crumb
-        r = self._session.get(f'{self._Q1}{path}', params=p,
-                              timeout=12)
-        r.raise_for_status()
-        return r.json()
+
+        last_err = None
+        for attempt in range(_retries):
+            try:
+                r = self._session.get(
+                    f'{self._Q1}{path}', params=p, timeout=15
+                )
+                if r.status_code == 429:
+                    wait = 2 ** (attempt + 1)
+                    _time.sleep(wait)
+                    if attempt == _retries - 1:
+                        raise RuntimeError(
+                            "Too Many Requests. Rate limited. "
+                            f"Try after a while. (waited {wait}s)"
+                        )
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last_err = e
+                if attempt < _retries - 1:
+                    _time.sleep(2 ** attempt)
+        raise last_err or RuntimeError("Request failed after retries")
 
     def history(self, period='1y', interval='1d'):
-        """Returns DataFrame with DatetimeIndex and 'Close' column."""
-        # '2d' is not a valid Yahoo range — use '5d' and slice
+        """Returns DataFrame with DatetimeIndex and 'Close' column (cached)."""
+        cache_key = (self._raw_symbol, 'history', period, interval)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         yf_period = '5d' if period == '2d' else period
-        data = self._get('/v8/finance/chart/' + self.symbol,
-                         {'interval': interval, 'range': yf_period, 'events': 'div'})
-        result  = data['chart']['result'][0]
-        ts      = result.get('timestamp', [])
-        closes  = result['indicators']['quote'][0].get('close', [])
-        volumes = result['indicators']['quote'][0].get('volume', [])
-        df = pd.DataFrame({
-            'Close':  closes,
-            'Volume': volumes,
-        }, index=pd.to_datetime(ts, unit='s', utc=True).tz_convert('America/New_York'))
-        df = df.dropna(subset=['Close'])
+        data   = self._get('/v8/finance/chart/' + self.symbol,
+                           {'interval': interval, 'range': yf_period, 'events': 'div'})
+        result = data['chart']['result'][0]
+        ts     = result.get('timestamp', [])
+        closes = result['indicators']['quote'][0].get('close', [])
+        vols   = result['indicators']['quote'][0].get('volume', [])
+        df = pd.DataFrame(
+            {'Close': closes, 'Volume': vols},
+            index=pd.to_datetime(ts, unit='s', utc=True).tz_convert('America/New_York')
+        ).dropna(subset=['Close'])
         if period == '2d':
             df = df.tail(2)
-        self._meta     = result['meta']
-        self._events   = result.get('events', {})
+        self._meta   = result['meta']
+        self._events = result.get('events', {})
+
+        _cache_set(cache_key, df)
         return df
 
     @property
     def info(self):
-        """Dict with dividendYield and other summary fields."""
-        # Always fetch 1y so we capture enough dividend events (5d misses them)
-        if not hasattr(self, '_meta') or not self._events.get('dividends'):
+        """Dict with dividendYield (cached)."""
+        cache_key = (self._raw_symbol, 'info')
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        if not hasattr(self, '_meta') or not getattr(self, '_events', {}).get('dividends'):
             self.history(period='1y')
-        meta = self._meta
+        meta      = self._meta
         div_yield = meta.get('dividendYield') or meta.get('trailingAnnualDividendYield')
         if not div_yield:
-            divs = self._events.get('dividends', {})
+            divs = getattr(self, '_events', {}).get('dividends', {})
             if divs:
                 amounts = sorted(divs.values(), key=lambda x: x['date'])[-4:]
                 annual  = sum(d['amount'] for d in amounts)
                 price   = meta.get('regularMarketPrice', 1)
                 div_yield = annual / price if price else 0.0
-        return {
-            'dividendYield':       div_yield or 0.0,
-            'regularMarketPrice':  meta.get('regularMarketPrice'),
-            'symbol':              meta.get('symbol'),
+        result = {
+            'dividendYield':      div_yield or 0.0,
+            'regularMarketPrice': meta.get('regularMarketPrice'),
+            'symbol':             meta.get('symbol'),
         }
+        _cache_set(cache_key, result)
+        return result
 
     @property
     def options(self):
-        """Tuple of expiry date strings ('YYYY-MM-DD')."""
-        data    = self._get('/v7/finance/options/' + self.symbol)
-        result  = data['optionChain']['result'][0]
-        return tuple(
+        """Tuple of expiry date strings — cached."""
+        cache_key = (self._raw_symbol, 'options')
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        data   = self._get('/v7/finance/options/' + self.symbol)
+        result = data['optionChain']['result'][0]
+        out    = tuple(
             datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d')
             for ts in result['expirationDates']
         )
+        _cache_set(cache_key, out)
+        return out
 
     def option_chain(self, date_str: str) -> _OptionChain:
-        """Returns namedtuple(calls=DataFrame, puts=DataFrame)."""
-        # Must use UTC midnight — Yahoo stores expiry timestamps in UTC
+        """Returns namedtuple(calls=DataFrame, puts=DataFrame) — cached."""
+        cache_key = (self._raw_symbol, 'chain', date_str)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         unix_ts = int(datetime.strptime(date_str, '%Y-%m-%d')
                       .replace(tzinfo=_tz.utc).timestamp())
-        data    = self._get('/v7/finance/options/' + self.symbol, {'date': unix_ts})
-        result  = data['optionChain']['result'][0]
-        opts    = result['options'][0] if result['options'] else {}
+        data   = self._get('/v7/finance/options/' + self.symbol, {'date': unix_ts})
+        result = data['optionChain']['result'][0]
+        opts   = result['options'][0] if result['options'] else {}
 
         def _to_df(contracts):
             if not contracts:
                 return pd.DataFrame()
             df = pd.DataFrame(contracts)
-            # Normalise column names to match what our code expects
-            renames = {'impliedVolatility': 'impliedVolatility',
-                       'lastPrice': 'lastPrice'}
-            df = df.rename(columns=renames)
-            for col in ['bid', 'ask', 'volume', 'openInterest', 'impliedVolatility', 'lastPrice']:
+            for col in ['bid', 'ask', 'volume', 'openInterest',
+                        'impliedVolatility', 'lastPrice']:
                 if col not in df.columns:
                     df[col] = 0
             df['volume']       = pd.to_numeric(df['volume'],       errors='coerce').fillna(0)
             df['openInterest'] = pd.to_numeric(df['openInterest'], errors='coerce').fillna(0)
             return df
 
-        return _OptionChain(
+        out = _OptionChain(
             calls=_to_df(opts.get('calls', [])),
             puts =_to_df(opts.get('puts',  [])),
         )
+        _cache_set(cache_key, out)
+        return out
+
+    @property
+    def calendar(self):
+        """
+        Dict with 'Earnings Date' list — sourced from quoteSummary calendarEvents.
+        Returns None if unavailable (no crash — earnings check is advisory only).
+        """
+        cache_key = (self._raw_symbol, 'calendar')
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            data   = self._get('/v10/finance/quoteSummary/' + self.symbol,
+                               {'modules': 'calendarEvents'})
+            events = (data.get('quoteSummary', {})
+                         .get('result', [{}])[0]
+                         .get('calendarEvents', {})
+                         .get('earnings', {}))
+            raw_dates = events.get('earningsDate', [])
+            dates     = [datetime.utcfromtimestamp(d['raw'])
+                         for d in raw_dates if isinstance(d, dict) and 'raw' in d]
+            result = {'Earnings Date': dates} if dates else None
+        except Exception:
+            result = None
+
+        _cache_set(cache_key, result)
+        return result
 
 
-def _ticker(symbol: str):
-    """Factory: returns a standard yfinance Ticker."""
-    return yf.Ticker(symbol)
+# ── Ticker factory: always returns _YFDirect (with caching + retry) ───────────
+_TICKER_INSTANCES: dict = {}
+
+def _ticker(symbol: str) -> _YFDirect:
+    """
+    Returns a cached _YFDirect instance for the symbol.
+    All data fetched through this instance is also cached for 5 minutes,
+    so repeated calls to .history() or .option_chain() within one analysis
+    run hit the in-process cache instead of Yahoo Finance's API.
+    """
+    sym = symbol.upper()
+    if sym not in _TICKER_INSTANCES:
+        _TICKER_INSTANCES[sym] = _YFDirect(sym)
+    return _TICKER_INSTANCES[sym]
 
 
 # ─── Treasury Yield Curve (wallstreet-inspired) ───────────────────────────────
@@ -331,7 +442,9 @@ def bs_second_order(S, K, T, r, sigma, option_type='call', q=0.0):
 
     vanna = -np.exp(-q * T) * nd1 * d2 / sigma          # ∂Δ/∂σ = ∂Vega/∂S
     volga = vega_raw * d1 * d2 / sigma                   # ∂²V/∂σ² (raw)
-    speed = -(nd1 * np.exp(-q * T)) / (Sq * sigma**2 * T) * (d1 / (sigma * np.sqrt(T)) + 1)
+    # Speed = ∂Γ/∂S = -Γ × (1 + d1/(σ√T)) / S  (Haug 2007, corrected)
+    gamma_raw = nd1 * np.exp(-q * T) / (S * sigma * np.sqrt(T))
+    speed = -gamma_raw * (1 + d1 / (sigma * np.sqrt(T))) / S
 
     if option_type == 'call':
         charm = -np.exp(-q * T) * nd1 * (2*(r-q)*T - d2*sigma*np.sqrt(T)) / (2*T*sigma*np.sqrt(T))
@@ -428,9 +541,12 @@ def garch_vol_forecast(log_returns, horizon=21):
             raise ValueError("insufficient data")
         am  = arch_model(ret_pct, vol='Garch', p=1, q=1, dist='normal', rescale=False)
         res = am.fit(disp='off', show_warning=False)
-        fc  = res.forecast(horizon=horizon)
+        fc    = res.forecast(horizon=horizon)
         var_h = fc.variance.values[-1]         # horizon daily variances (pct²)
-        ann_vol = float(np.sqrt(np.mean(var_h) * 252)) / 100
+        # Use terminal variance (last point of horizon), not average.
+        # Bollerslev 1986: h-step forecast = terminal conditional variance.
+        # Averaging underestimates vol in trending, overestimates in mean-reverting regimes.
+        ann_vol = float(np.sqrt(var_h[-1] * 252)) / 100
         params  = res.params
         persistence = float(params.get('alpha[1]', 0) + params.get('beta[1]', 0))
         return {'vol': round(ann_vol, 4), 'persistence': round(persistence, 4),
@@ -970,9 +1086,24 @@ def find_iron_condor(chain_df: pd.DataFrame, S: float,
                     - long_put_row['Mid Price']  - long_call_row['Mid Price'])
     put_spread   = short_put_K  - long_put_K
     call_spread  = long_call_K  - short_call_K
-    max_loss     = max(put_spread, call_spread) - net_credit
-    bp_required  = max_loss * 100   # per contract
-    ror          = net_credit / max_loss * 100 if max_loss > 0 else np.nan
+    wing_width   = max(put_spread, call_spread)
+
+    if net_credit > 0:
+        # Standard iron condor: net credit received
+        max_loss = wing_width - net_credit
+        be_low   = short_put_K  - net_credit
+        be_high  = short_call_K + net_credit
+    else:
+        # Net debit (unusual) — max loss = net debit paid + any spread reversal
+        max_loss = wing_width + abs(net_credit)
+        be_low   = short_put_K  + net_credit   # credit is negative, so shifts out
+        be_high  = short_call_K - net_credit
+
+    if max_loss <= 0:
+        return {}   # zero/negative max_loss is nonsensical — data quality issue
+
+    bp_required = max_loss * 100
+    ror         = net_credit / max_loss * 100 if max_loss > 0 else np.nan
 
     return {
         'long_put_strike':   long_put_K,
@@ -983,8 +1114,8 @@ def find_iron_condor(chain_df: pd.DataFrame, S: float,
         'max_loss ($)':      round(max_loss, 2),
         'bp_required ($)':   round(bp_required, 2),
         'return_on_risk (%)':round(ror, 2) if not np.isnan(ror) else np.nan,
-        'breakeven_low':     round(short_put_K  - net_credit, 2),
-        'breakeven_high':    round(short_call_K + net_credit, 2),
+        'breakeven_low':     round(be_low, 2),
+        'breakeven_high':    round(be_high, 2),
         'expiry':            chain_df['Expiry'].iloc[0],
     }
 
@@ -1057,8 +1188,8 @@ def analyze_chain(symbol, expiry_str, S, hv, q=0.0):
                 'Bid':                     row.get('bid', np.nan),
                 'Ask':                     row.get('ask', np.nan),
                 'Last Price':              row['lastPrice'],
-                'Volume':                  row.get('volume', 0) or 0,
-                'Open Interest':           row.get('openInterest', 0) or 0,
+                'Volume':                  int(pd.to_numeric(row.get('volume', 0), errors='coerce') or 0),
+                'Open Interest':           int(pd.to_numeric(row.get('openInterest', 0), errors='coerce') or 0),
                 'IV (%)':                  round(iv * 100, 2) if not np.isnan(iv) else np.nan,
                 'HV (%)':                  round(hv * 100, 2),
                 'IV-HV Spread (%)':        round((iv - hv) * 100, 2) if not np.isnan(iv) else np.nan,
@@ -1598,7 +1729,7 @@ def main():
         signal = 'vol sellers edge' if spread > 0 else 'vol buyers edge'
         print(f"\nATM IV: {atm_iv:.1f}%  |  HV: {hv*100:.1f}%  |  IV Premium: {spread:+.1f}%  ({signal})")
 
-        # GARCH(1,1) vol forecast alongside HAR-RV
+        # GARCH(1,1) vol forecast alongside HAR-RV (reuse cached history)
         try:
             _hist_px  = list(_ticker(symbol).history(period='1y')['Close'].dropna())
             _log_rets = [np.log(_hist_px[k]/_hist_px[k-1]) for k in range(1, len(_hist_px))]
@@ -1627,12 +1758,10 @@ def main():
         except Exception:
             pass
 
-        # Pin risk for nearest expiry
+        # Pin risk for nearest expiry (reuse all_dfs[0] — no extra API call)
         try:
-            _exp_chain = _ticker(symbol).option_chain(expirations[0])
-            _combined  = pd.concat([_exp_chain.calls.assign(type='call'),
-                                    _exp_chain.puts.assign(type='put')])
-            _combined.rename(columns={'openInterest': 'Open Interest', 'strike': 'Strike'}, inplace=True)
+            _combined  = all_dfs[0].copy()
+            _combined.rename(columns={'Open Interest': 'Open Interest', 'Strike': 'Strike'}, inplace=True)
             _pin = pin_risk_score(S, _combined[['Strike','Open Interest']])
             if _pin:
                 _pstr = 'STRONG' if _pin['pin_strength'] > 0.4 else 'MODERATE' if _pin['pin_strength'] > 0.2 else 'WEAK'
@@ -2033,7 +2162,8 @@ def smart_exit_levels(S: float, K: float, T: float, r: float, sigma: float,
 
 # ─── Institutional signal helpers ─────────────────────────────────────────────
 
-def iv_rank_percentile(symbol: str, current_iv: float, period: str = '1y'):
+def iv_rank_percentile(symbol: str, current_iv: float,
+                        period: str = '1y', prices: list = None):
     """
     IV Rank and IV Percentile — the single most-used institutional filter.
 
@@ -2041,13 +2171,18 @@ def iv_rank_percentile(symbol: str, current_iv: float, period: str = '1y'):
     any long-vol trade. IVR < 30 = cheap; IVR > 60 = expensive, don't buy.
 
     Uses rolling 21d HV as IV proxy (no historical IV feed required).
+    Pass `prices` to avoid an extra API call when history is already fetched.
     Returns (iv_rank 0–100, iv_percentile 0–100) or (nan, nan) on failure.
     """
     try:
-        hist = _ticker(symbol).history(period=period)['Close'].dropna()
+        if prices and len(prices) >= 30:
+            # Use pre-fetched price list to avoid duplicate API call
+            hist = pd.Series(prices)
+        else:
+            hist = _ticker(symbol).history(period=period)['Close'].dropna()
         if len(hist) < 30:
             return np.nan, np.nan
-        lr = np.log(hist / hist.shift(1)).dropna()
+        lr      = np.log(hist / hist.shift(1)).dropna()
         hv_roll = lr.rolling(21).std().dropna() * np.sqrt(252)
         if len(hv_roll) < 2:
             return np.nan, np.nan
@@ -2299,19 +2434,10 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
     # ── Institutional pre-scan signals (computed once, reused in loop) ──────────
     opt_str_pre = 'call' if option_type.startswith('c') else 'put'
 
-    # 1. IVR / IVP — Goldman/Citadel screen #1: is vol cheap or expensive?
-    print("  Computing IV Rank / IV Percentile...")
-    ivr, ivp = iv_rank_percentile(symbol, hv)
-    if not np.isnan(ivr):
-        ivr_label = ('CHEAP — good time to buy vol' if ivr < 30
-                     else 'FAIR' if ivr < 60
-                     else 'EXPENSIVE — vol buyers get edge only if IVR < 40')
-        print(f"  IVR: {ivr:.0f}  |  IVP: {ivp:.0f}  →  {ivr_label}")
-
-    # 2. Historical mu (P-measure drift) for real-world EV
+    # Fetch 2y history ONCE — reused for IVR, RSI, mu, GARCH (no extra API calls)
     try:
-        _px_hist = list(_ticker(symbol).history(period='2y')['Close'].dropna())
-        _lr_hist = [np.log(_px_hist[k]/_px_hist[k-1]) for k in range(1, len(_px_hist))]
+        _px_hist  = list(_ticker(symbol).history(period='2y')['Close'].dropna())
+        _lr_hist  = [np.log(_px_hist[k]/_px_hist[k-1]) for k in range(1, len(_px_hist))]
         mu_annual = float(np.mean(_lr_hist[-252:]) * 252) if len(_lr_hist) >= 252 else 0.08
         rsi_14    = compute_rsi(_px_hist)
     except Exception:
@@ -2319,9 +2445,19 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
         _lr_hist  = []
         mu_annual = 0.08
         rsi_14    = 50.0
+
+    # 1. IVR / IVP — Goldman/Citadel screen #1: is vol cheap or expensive?
+    print("  Computing IV Rank / IV Percentile...")
+    ivr, ivp = iv_rank_percentile(symbol, hv, prices=_px_hist)
+    if not np.isnan(ivr):
+        ivr_label = ('CHEAP — good time to buy vol' if ivr < 30
+                     else 'FAIR' if ivr < 60
+                     else 'EXPENSIVE — vol buyers get edge only if IVR < 40')
+        print(f"  IVR: {ivr:.0f}  |  IVP: {ivp:.0f}  →  {ivr_label}")
+
     print(f"  RSI(14): {rsi_14:.1f}  |  1y mu (drift): {mu_annual*100:+.1f}%/yr")
 
-    # 3. Earnings calendar risk
+    # 2. Earnings calendar risk
     has_earnings, earnings_date = earnings_within_dte(symbol, dte_max)
     if has_earnings:
         print(f"  ⚠  Earnings within DTE window: {earnings_date}  "
@@ -2430,30 +2566,45 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
                 else:
                     delta_score = -20   # deep OTM lottery ticket
 
-                # Signal 4: Momentum alignment via RSI
+                # Signal 4: Momentum position via RSI (mean-reversion aware)
+                # Institutions use RSI to AVOID exhausted moves, not chase them.
+                # Best call entry: RSI 35–55 (stock rising from rest, not overbought).
+                # Best put entry: RSI 45–65 (stock falling from elevated levels).
                 rsi_score = 0.0
                 if opt_str == 'call':
-                    if 40 <= rsi_14 <= 62:     rsi_score = 15   # fresh uptrend
-                    elif 62 < rsi_14 <= 72:    rsi_score = 0    # getting extended
-                    elif rsi_14 > 72:          rsi_score = -20  # overbought — chasing
-                    elif rsi_14 < 35:          rsi_score = -15  # call on falling knife
+                    if 35 <= rsi_14 <= 55:     rsi_score = 20   # ideal: fresh / not extended
+                    elif 55 < rsi_14 <= 65:    rsi_score = 8    # slightly extended but OK
+                    elif 65 < rsi_14 <= 72:    rsi_score = -8   # getting overbought
+                    elif rsi_14 > 72:          rsi_score = -25  # overbought — momentum exhausted
+                    elif 25 <= rsi_14 < 35:    rsi_score = -8   # oversold bounce? risky call
+                    elif rsi_14 < 25:          rsi_score = -20  # falling knife — don't buy calls
                 else:  # put
-                    if 38 <= rsi_14 <= 60:     rsi_score = 15   # fresh downtrend
-                    elif 28 <= rsi_14 < 38:    rsi_score = 0    # getting extended
-                    elif rsi_14 < 28:          rsi_score = -20  # oversold panic — puts expensive
-                    elif rsi_14 > 65:          rsi_score = -15  # put on rising stock
+                    if 45 <= rsi_14 <= 65:     rsi_score = 20   # ideal: turning down from elevated
+                    elif 35 <= rsi_14 < 45:    rsi_score = 8    # slightly extended downside
+                    elif 28 <= rsi_14 < 35:    rsi_score = -8   # oversold — puts now expensive
+                    elif rsi_14 < 28:          rsi_score = -25  # panic oversold — puts at peak price
+                    elif 65 < rsi_14 <= 75:    rsi_score = -5   # put on overbought? possible
+                    elif rsi_14 > 75:          rsi_score = -15  # put on very strong uptrend, bad entry
 
-                # Signal 5: Move needed — don't need stock to gap 20% to profit
-                move_score = max(-30.0, -breakeven_move_pct * 1.2)
+                # Signal 5: Move needed — penalize far-OTM breakevens non-linearly
+                # Under 5%: free money territory; 10–15%: fair; 20%+: lottery ticket
+                move_score = max(-30.0, -(breakeven_move_pct ** 1.3) * 0.8)
 
-                # Signal 6: IV vs HV — paying premium vs getting discount
-                iv_score = -max(iv_hv_spread, 0) * 0.5 + min(0, iv_hv_spread) * 0.3
+                # Signal 6: IV vs HV — symmetric: cheap IV rewarded equally to expensive IV penalized
+                # Fix: Previous code rewarded cheap vol only 0.3x but penalized expensive 0.5x.
+                # Now both use 0.5x — symmetrical edge scoring.
+                iv_score = -abs(max(iv_hv_spread, 0)) * 0.5 + abs(min(0, iv_hv_spread)) * 0.5
 
-                # Signal 7: Earnings penalty — vol crush risk
-                earn_penalty = -25 if has_earnings else 0
+                # Signal 7: Earnings penalty — magnitude-scaled by IV inflation
+                # If IV is very high (IVR > 70), earnings crush will be severe → bigger penalty
+                earn_base    = -25 if has_earnings else 0
+                earn_penalty = earn_base * (1.5 if not np.isnan(ivr) and ivr > 70 else 1.0)
 
-                # Signal 8: IV-HV when IV already low — extra reward for buying cheap
-                cheap_bonus = 10 if iv_hv_spread < -5 else 0
+                # Signal 8: Extra reward for buying genuinely cheap vol (IV-HV < -8%)
+                # Only applies when IVR also confirms cheapness
+                cheap_bonus = (15 if iv_hv_spread < -8 and not np.isnan(ivr) and ivr < 30
+                               else 8 if iv_hv_spread < -5
+                               else 0)
 
                 score = (
                     ivr_score
@@ -2468,7 +2619,7 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
                 )
 
                 # Kelly fraction for display in scorecard
-                avg_win_mult = (take_profit_est := 1.5)  # assume 1.5x avg winner
+                avg_win_mult = 1.5   # assume 1.5x avg winner on profitable exits
                 kelly = kelly_fraction_options(p_itm_pct / 100, avg_win_mult)
 
             else:  # sellers
@@ -2522,8 +2673,8 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
                 'Move Needed (%)':        round(breakeven_move_pct, 1),
                 'Prob ITM (%)':           round(p_itm * 100, 1) if not np.isnan(p_itm) else np.nan,
                 'Expected Move ($)':      round(exp_mv, 2),
-                'Volume':                 row.get('volume', 0) or 0,
-                'Open Interest':          row.get('openInterest', 0) or 0,
+                'Volume':                 int(pd.to_numeric(row.get('volume', 0), errors='coerce') or 0),
+                'Open Interest':          int(pd.to_numeric(row.get('openInterest', 0), errors='coerce') or 0),
                 'Score':                  round(score, 3),
             })
 
@@ -2628,15 +2779,19 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
     print(f"  ─── Momentum (RSI) ─────────────────────")
     rsi_v = best.get('RSI(14)', rsi_14)
     if opt_str_pre == 'call':
-        rsi_label = ('✓ Fresh uptrend — not extended' if 40 <= rsi_v <= 62
-                     else '⚠ Getting overbought' if 62 < rsi_v <= 72
-                     else '✗ Overbought — chasing' if rsi_v > 72
-                     else '✗ Falling knife — calls risky')
+        rsi_label = ('✓ Ideal zone — fresh move, not extended'   if 35 <= rsi_v <= 55
+                     else '✓ Slightly extended — OK to enter'    if 55 < rsi_v <= 65
+                     else '⚠ Getting overbought — momentum tiring' if 65 < rsi_v <= 72
+                     else '✗ Overbought — do NOT chase calls'    if rsi_v > 72
+                     else '⚠ Oversold bounce — risky call entry' if 25 <= rsi_v < 35
+                     else '✗ Falling knife — calls very risky')
     else:
-        rsi_label = ('✓ Fresh downtrend — not extended' if 38 <= rsi_v <= 60
-                     else '⚠ Getting oversold' if 28 <= rsi_v < 38
-                     else '✗ Oversold panic — puts expensive' if rsi_v < 28
-                     else '✗ Rising stock — puts risky')
+        rsi_label = ('✓ Ideal zone — turning down from elevated'  if 45 <= rsi_v <= 65
+                     else '✓ Extended downside — still tradeable' if 35 <= rsi_v < 45
+                     else '⚠ Oversold — puts getting expensive'  if 28 <= rsi_v < 35
+                     else '✗ Panic oversold — puts at peak price' if rsi_v < 28
+                     else '⚠ Put on strong uptrend — careful'    if rsi_v > 75
+                     else '✓ Pullback potential — OK for puts')
     print(f"  RSI(14):             {rsi_v:.1f}  →  {rsi_label}")
 
     print(f"  ─── Risk / Reward ──────────────────────")
@@ -2666,11 +2821,13 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
             print(f"  ⚠  Earnings on {earnings_date} — IV will collapse after announcement.")
             print(f"     If trading through earnings: buy a straddle, not a directional contract.")
     print(f"  ─── Liquidity ──────────────────────────")
-    print(f"  Volume:              {int(best['Volume']):,}")
-    print(f"  Open Interest:       {int(best['Open Interest']):,}")
+    _vol = int(best['Volume'])       if (pd.notna(best['Volume'])       and best['Volume'] == best['Volume']) else 0
+    _oi  = int(best['Open Interest']) if (pd.notna(best['Open Interest']) and best['Open Interest'] == best['Open Interest']) else 0
+    print(f"  Volume:              {_vol:,}")
+    print(f"  Open Interest:       {_oi:,}")
     bid_ok  = best['Bid'] > 0 and best['Ask'] > 0
-    oi_ok   = best['Open Interest'] > 50
-    vol_ok  = best['Volume'] > 20
+    oi_ok   = _oi > 50
+    vol_ok  = _vol > 20
     spread_ok = best['Bid-Ask Spread ($)'] < best['Mid Price ($)'] * 0.10
     if not bid_ok and not market_open:
         liq = 'UNQUOTED (market closed — check bid/ask after 9:30 AM ET)'
@@ -2710,12 +2867,11 @@ def find_trade(symbol=None, S=None, hv=None, q=None):
         gbe = gamma_breakeven_move(g1['gamma'], g1['theta'], S)
         # Delta-Gamma VaR (99%, 1-day)
         var1d = delta_gamma_var(g1['delta'], g1['gamma'], S, sig_b)
-        # GARCH vol forecast
-        hist_px = list(_ticker(symbol).history(period='1y')['Close'].dropna())
-        log_rets = [np.log(hist_px[k]/hist_px[k-1]) for k in range(1, len(hist_px))] if len(hist_px) > 50 else []
+        # GARCH vol forecast — reuse _px_hist / _lr_hist already fetched above
+        log_rets = _lr_hist if _lr_hist else []
         garch_fc = garch_vol_forecast(log_rets, horizon=int(T_b * 252) or 21) if log_rets else None
         # D-P exit threshold
-        mu_est = float(np.mean(log_rets[-252:]) * 252) if len(log_rets) >= 252 else 0.08
+        mu_est = mu_annual  # already computed from _lr_hist[-252:]
         dp_exit = dp_exit_threshold(K_b, mu_est, sig_b, r_b) if opt_type_str == 'call' else None
         # Pin risk
         nearest_chain_df = None
@@ -2910,16 +3066,20 @@ def backtest_model():
         if np.isnan(hv) or hv <= 0.01:
             continue
 
-        # ATM IV proxy: use BS-inverted close-to-close 30-day vol as IV stand-in
-        # Real backtesting would use historical IV surface — this is the best
-        # approximation available without paid data.
-        window_prices = prices[max(0, ei-30): ei]
-        log_rets_30   = [np.log(window_prices[k] / window_prices[k-1])
-                         for k in range(1, len(window_prices))]
-        rv_30         = float(np.std(log_rets_30) * np.sqrt(252)) if log_rets_30 else hv
-        # VRP = realised vol (proxy for IV) − HAR-RV forecast
-        vrp           = rv_30 - hv   # positive → IV rich → sellers edge
-                                     # negative → IV cheap → buyers edge
+        # ATM IV proxy: Use the HAR-RV *forward* forecast as our IV stand-in.
+        # This eliminates look-ahead bias: the trader on entry date would form
+        # a vol forecast using data BEFORE the entry date, not realised vol AFTER.
+        # rv_30 (the previous approach) used realized vol from the same 30 days
+        # we're about to trade — that's looking into the future.
+        # Correct approach: GARCH(1,1) conditioned on pre-entry returns.
+        window_prices  = prices[max(0, ei-90): ei]
+        log_rets_pre   = [np.log(window_prices[k] / window_prices[k-1])
+                          for k in range(1, len(window_prices))]
+        garch_pre = garch_vol_forecast(log_rets_pre, horizon=21)
+        iv_proxy  = garch_pre['vol'] if garch_pre else hv   # forward-looking GARCH as IV
+        # VRP = forecasted vol (IV proxy) − HAR-RV baseline forecast
+        vrp = iv_proxy - hv   # positive → IV rich → sellers edge
+                               # negative → IV cheap → buyers edge
 
         # Direction
         if dir_input == 'a':
@@ -3750,14 +3910,15 @@ def backtest_scanner(watchlist=None, lookback_days=252, holding_days=14,
                 else:
                     continue   # ambiguous direction → skip
 
-                if spy_bearish and direction == 'call':
-                    skipped_regime += 1
-                    continue
+                # SPY regime: penalise calls in stress (not hard-skip — valid setups still pass min_score)
+                spy_regime_penalty = -20 if (spy_bearish and direction == 'call') else 0
+                if spy_regime_penalty < 0:
+                    skipped_regime += 1   # count but don't skip
 
                 # Scoring
                 vrp_proxy    = (forecast_avg - hv_30) * 100
                 mom_strength = abs(ret_5d) + abs(ret_20d) * 0.5
-                score = 0.0
+                score = float(spy_regime_penalty)   # start from regime adjustment
 
                 if vrp_proxy > 10:
                     score += 35

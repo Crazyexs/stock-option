@@ -62,6 +62,17 @@ def run_cli_function(func, prompt_map, *args, **kwargs):
                 "  3. If on Streamlit Cloud, multiple users may share the same IP.\n"
                 "     Consider running locally for heavy scans.\n"
             )
+        elif "401" in err or "unauthorized" in err.lower():
+            output += (
+                "\n\n⚠  DATA ACCESS ERROR (Yahoo Finance HTTP 401)\n"
+                "──────────────────────────────────────────────\n"
+                "Yahoo Finance blocked this server's IP (cloud IPs are sometimes banned).\n"
+                "The engine has automatically switched to the standard yfinance fallback.\n"
+                "Fixes:\n"
+                "  1. Click Run again — the fallback mode is now active and should work.\n"
+                "  2. If it persists, wait 30 seconds and retry.\n"
+                "  3. For heavy scans, run the tool locally to avoid cloud IP blocks.\n"
+            )
         else:
             output += f"\n\nERROR: {err}"
         result = None

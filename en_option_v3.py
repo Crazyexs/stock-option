@@ -79,6 +79,10 @@ def _cache_set(key, value):
     _DATA_CACHE[key] = (value, _time.time())
 
 
+class _AuthError(Exception):
+    """Raised when Yahoo Finance returns HTTP 401 and re-auth also fails."""
+
+
 class _YFDirect:
     """
     Drop-in replacement for yf.Ticker() that bypasses fc.yahoo.com entirely,
@@ -106,9 +110,17 @@ class _YFDirect:
     }
 
     def __init__(self, symbol: str):
-        self.symbol      = symbol.upper().replace('^', '%5E')
-        self._raw_symbol = symbol.upper()
+        self.symbol           = symbol.upper().replace('^', '%5E')
+        self._raw_symbol      = symbol.upper()
+        self._use_yf_fallback = False
+        self._yftk            = None
         _YFDirect._ensure_session()
+
+    def _yf_fallback(self):
+        """Lazily created yf.Ticker — used when direct API gets persistent 401."""
+        if self._yftk is None:
+            self._yftk = yf.Ticker(self._raw_symbol)
+        return self._yftk
 
     @classmethod
     def _ensure_session(cls):
@@ -136,13 +148,15 @@ class _YFDirect:
     def _get(self, path, params=None, _retries=4):
         """
         GET with exponential back-off on 429 / 5xx.
-        Waits 2s, 4s, 8s, 16s before giving up.
+        On 401: tries one re-auth (reset + new session), then raises _AuthError
+        so callers can fall back to standard yfinance.
         """
         p = dict(params or {})
         if self._crumb:
             p['crumb'] = self._crumb
 
-        last_err = None
+        last_err      = None
+        _auth_retried = False
         for attempt in range(_retries):
             try:
                 r = self._session.get(
@@ -157,9 +171,22 @@ class _YFDirect:
                             f"Try after a while. (waited {wait}s)"
                         )
                     continue
+                if r.status_code == 401:
+                    if not _auth_retried:
+                        _auth_retried = True
+                        _YFDirect._reset_session()
+                        _YFDirect._ensure_session()
+                        p = dict(params or {})
+                        if self._crumb:
+                            p['crumb'] = self._crumb
+                        continue
+                    raise _AuthError(
+                        "HTTP 401 Unauthorized – Yahoo Finance blocked this server IP. "
+                        "Switching to standard yfinance fallback."
+                    )
                 r.raise_for_status()
                 return r.json()
-            except RuntimeError:
+            except (_AuthError, RuntimeError):
                 raise
             except Exception as e:
                 last_err = e
@@ -174,21 +201,30 @@ class _YFDirect:
         if cached is not None:
             return cached
 
-        yf_period = '5d' if period == '2d' else period
-        data   = self._get('/v8/finance/chart/' + self.symbol,
-                           {'interval': interval, 'range': yf_period, 'events': 'div'})
-        result = data['chart']['result'][0]
-        ts     = result.get('timestamp', [])
-        closes = result['indicators']['quote'][0].get('close', [])
-        vols   = result['indicators']['quote'][0].get('volume', [])
-        df = pd.DataFrame(
-            {'Close': closes, 'Volume': vols},
-            index=pd.to_datetime(ts, unit='s', utc=True).tz_convert('America/New_York')
-        ).dropna(subset=['Close'])
-        if period == '2d':
-            df = df.tail(2)
-        self._meta   = result['meta']
-        self._events = result.get('events', {})
+        try:
+            if self._use_yf_fallback:
+                raise _AuthError("fallback mode active")
+            yf_period = '5d' if period == '2d' else period
+            data   = self._get('/v8/finance/chart/' + self.symbol,
+                               {'interval': interval, 'range': yf_period, 'events': 'div'})
+            result = data['chart']['result'][0]
+            ts     = result.get('timestamp', [])
+            closes = result['indicators']['quote'][0].get('close', [])
+            vols   = result['indicators']['quote'][0].get('volume', [])
+            df = pd.DataFrame(
+                {'Close': closes, 'Volume': vols},
+                index=pd.to_datetime(ts, unit='s', utc=True).tz_convert('America/New_York')
+            ).dropna(subset=['Close'])
+            if period == '2d':
+                df = df.tail(2)
+            self._meta   = result['meta']
+            self._events = result.get('events', {})
+        except _AuthError:
+            self._use_yf_fallback = True
+            yf_period = '5d' if period == '2d' else period
+            df = self._yf_fallback().history(period=yf_period, interval=interval)
+            if period == '2d':
+                df = df.tail(2)
 
         _cache_set(cache_key, df)
         return df
@@ -203,6 +239,21 @@ class _YFDirect:
 
         if not hasattr(self, '_meta') or not getattr(self, '_events', {}).get('dividends'):
             self.history(period='1y')
+
+        if self._use_yf_fallback or not hasattr(self, '_meta'):
+            try:
+                raw = self._yf_fallback().info or {}
+            except Exception:
+                raw = {}
+            result = {
+                'dividendYield':      (raw.get('dividendYield')
+                                       or raw.get('trailingAnnualDividendYield') or 0.0),
+                'regularMarketPrice': raw.get('regularMarketPrice') or raw.get('currentPrice'),
+                'symbol':             raw.get('symbol', self._raw_symbol),
+            }
+            _cache_set(cache_key, result)
+            return result
+
         meta      = self._meta
         div_yield = meta.get('dividendYield') or meta.get('trailingAnnualDividendYield')
         if not div_yield:
@@ -228,12 +279,19 @@ class _YFDirect:
         if cached is not None:
             return cached
 
-        data   = self._get('/v7/finance/options/' + self.symbol)
-        result = data['optionChain']['result'][0]
-        out    = tuple(
-            datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d')
-            for ts in result['expirationDates']
-        )
+        try:
+            if self._use_yf_fallback:
+                raise _AuthError("fallback mode active")
+            data   = self._get('/v7/finance/options/' + self.symbol)
+            result = data['optionChain']['result'][0]
+            out    = tuple(
+                datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d')
+                for ts in result['expirationDates']
+            )
+        except _AuthError:
+            self._use_yf_fallback = True
+            out = tuple(self._yf_fallback().options)
+
         _cache_set(cache_key, out)
         return out
 
@@ -243,12 +301,6 @@ class _YFDirect:
         cached = _cache_get(cache_key)
         if cached is not None:
             return cached
-
-        unix_ts = int(datetime.strptime(date_str, '%Y-%m-%d')
-                      .replace(tzinfo=_tz.utc).timestamp())
-        data   = self._get('/v7/finance/options/' + self.symbol, {'date': unix_ts})
-        result = data['optionChain']['result'][0]
-        opts   = result['options'][0] if result['options'] else {}
 
         def _to_df(contracts):
             if not contracts:
@@ -262,10 +314,23 @@ class _YFDirect:
             df['openInterest'] = pd.to_numeric(df['openInterest'], errors='coerce').fillna(0)
             return df
 
-        out = _OptionChain(
-            calls=_to_df(opts.get('calls', [])),
-            puts =_to_df(opts.get('puts',  [])),
-        )
+        try:
+            if self._use_yf_fallback:
+                raise _AuthError("fallback mode active")
+            unix_ts = int(datetime.strptime(date_str, '%Y-%m-%d')
+                          .replace(tzinfo=_tz.utc).timestamp())
+            data   = self._get('/v7/finance/options/' + self.symbol, {'date': unix_ts})
+            result = data['optionChain']['result'][0]
+            opts   = result['options'][0] if result['options'] else {}
+            out = _OptionChain(
+                calls=_to_df(opts.get('calls', [])),
+                puts =_to_df(opts.get('puts',  [])),
+            )
+        except _AuthError:
+            self._use_yf_fallback = True
+            raw = self._yf_fallback().option_chain(date_str)
+            out = _OptionChain(calls=raw.calls, puts=raw.puts)
+
         _cache_set(cache_key, out)
         return out
 
